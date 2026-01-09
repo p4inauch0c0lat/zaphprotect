@@ -66,16 +66,18 @@ async def reset_pings():
     try:
         now = datetime.utcnow()
         for slot in slots.values():
-            if slot["end_date"] is None or slot["end_date"] > now:  # Lifetime slots or active slots
+            end_date = slot.get("end_date")
+            if end_date is None or end_date > now:  # Lifetime slots or active slots
                 slot["pings_used"] = {"here": 0, "everyone": 0}
+                slot.setdefault("pings", {"here": 0, "everyone": 0})
                 # Reset daily pings (e.g., 1x @here for weekly slots)
-                if "week" in slot["duration"]:
+                if "week" in slot.get("duration", ""):
                     slot["pings"]["here"] = 1
-                elif "month" in slot["duration"]:
+                elif "month" in slot.get("duration", ""):
                     slot["pings"]["here"] = 2
-                elif "year" in slot["duration"]:
+                elif "year" in slot.get("duration", ""):
                     slot["pings"]["here"] = 3
-                elif "lifetime" in slot["duration"]:
+                elif "lifetime" in slot.get("duration", ""):
                     slot["pings"]["here"] = 3
                     slot["pings"]["everyone"] = 1
         logger.info("Pings have been reset.")
@@ -86,7 +88,8 @@ async def reset_pings():
 @bot.event
 async def on_ready():
     await bot.tree.sync()  # Sync slash commands
-    reset_pings.start()  # Start the daily ping reset
+    if not reset_pings.is_running():
+        reset_pings.start()  # Start the daily ping reset
     logger.info("Bot is ready as %s", bot.user)
 
 # Define the options for the duration dropdown (week, month, year, lifetime)
@@ -119,6 +122,17 @@ async def slot(
             )
             return
 
+        if interaction.guild is None:
+            await send_response(
+                interaction,
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        if here < 0 or everyone < 0:
+            raise SlotError("Additional ping values must be zero or greater.")
+
         # Parse the duration and time to get a timedelta
         delta, normalized_duration = parse_duration(duration, time)
         end_date = datetime.utcnow() + delta if delta else None
@@ -140,9 +154,23 @@ async def slot(
         # Apply additional pings if specified
         total_here = default_here + here if here else default_here
         total_everyone = default_everyone + everyone if everyone else default_everyone
+        if total_here < 0 or total_everyone < 0:
+            raise SlotError("Ping totals cannot be negative.")
 
         # Create a channel (slot) for the user
         guild = interaction.guild
+        if user.id in slots:
+            existing_slot = slots[user.id]
+            existing_end = existing_slot.get("end_date")
+            if existing_end is None or existing_end > datetime.utcnow():
+                raise SlotError("This user already has an active slot.")
+
+        bot_member = guild.get_member(bot.user.id) if bot.user else None
+        if bot_member is None:
+            raise SlotError("Bot member data is unavailable in this guild.")
+        if not bot_member.guild_permissions.manage_channels:
+            raise SlotError("I need the Manage Channels permission to create slot channels.")
+
         channel_name = f"slot-{user.name}"
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),  # Everyone cannot read messages by default
@@ -151,7 +179,12 @@ async def slot(
         }
 
         # Create the channel
-        channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+        try:
+            channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+        except discord.Forbidden as exc:
+            raise SlotError("I do not have permission to create channels.") from exc
+        except discord.HTTPException as exc:
+            raise SlotError("Failed to create the slot channel. Please try again later.") from exc
 
         # Create a slot record
         slots[user.id] = {
@@ -198,6 +231,14 @@ async def slot(
 async def ping(interaction: discord.Interaction, ping_type: str):
     try:
         user = interaction.user
+        if interaction.guild is None:
+            await send_response(
+                interaction,
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
         normalized_type = ping_type.lower().strip()
         if normalized_type not in {"here", "everyone"}:
             await send_response(
@@ -213,6 +254,23 @@ async def ping(interaction: discord.Interaction, ping_type: str):
             return
 
         slot = slots[user.id]
+        end_date = slot.get("end_date")
+        if end_date is not None and end_date <= datetime.utcnow():
+            slots.pop(user.id, None)
+            await send_response(
+                interaction,
+                "Your slot has expired. Please contact an owner to renew it.",
+                ephemeral=True,
+            )
+            return
+
+        if slot.get("hold"):
+            await send_response(
+                interaction,
+                "Your slot is currently on hold.",
+                ephemeral=True,
+            )
+            return
 
         # Check if the user has any pings left
         if slot["pings_used"]["here"] >= slot["pings"]["here"] and slot["pings_used"]["everyone"] >= slot["pings"]["everyone"]:
@@ -244,6 +302,8 @@ async def ping(interaction: discord.Interaction, ping_type: str):
                 ephemeral=True,
             )
     
+    except SlotError as exc:
+        await send_response(interaction, str(exc), ephemeral=True)
     except Exception:
         logger.exception("Error while processing ping")
         await send_response(
@@ -255,6 +315,11 @@ async def ping(interaction: discord.Interaction, ping_type: str):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandInvokeError):
+        original = error.original
+        if isinstance(original, SlotError):
+            await send_response(interaction, str(original), ephemeral=True)
+            return
     logger.exception("Unhandled command error: %s", error)
     await send_response(
         interaction,
