@@ -60,6 +60,33 @@ async def send_response(interaction: discord.Interaction, message: str, **kwargs
     else:
         await interaction.response.send_message(message, **kwargs)
 
+
+async def expire_slot(slot, reason: str):
+    channel = slot.get("channel")
+    if channel:
+        try:
+            await channel.set_permissions(
+                channel.guild.default_role,
+                send_messages=False,
+                add_reactions=False,
+            )
+            await channel.set_permissions(
+                slot.get("user"),
+                send_messages=False,
+                add_reactions=False,
+            )
+            embed = discord.Embed(
+                title="Slot expired",
+                description=reason,
+                color=discord.Color.red(),
+            )
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Missing permissions to update channel %s", channel.id)
+        except discord.HTTPException:
+            logger.exception("Failed to update channel %s", channel.id)
+    slot["expired"] = True
+
 # Task to reset pings every day at midnight
 @tasks.loop(hours=24)
 async def reset_pings():
@@ -67,6 +94,12 @@ async def reset_pings():
         now = datetime.utcnow()
         for slot in slots.values():
             end_date = slot.get("end_date")
+            if end_date is not None and end_date <= now and not slot.get("expired"):
+                await expire_slot(
+                    slot,
+                    "This slot has reached its end date and is now locked.",
+                )
+                continue
             if end_date is None or end_date > now:  # Lifetime slots or active slots
                 slot["pings_used"] = {"here": 0, "everyone": 0}
                 slot.setdefault("pings", {"here": 0, "everyone": 0})
@@ -194,6 +227,7 @@ async def slot(
             "pings": {"here": total_here, "everyone": total_everyone},
             "pings_used": {"here": 0, "everyone": 0},
             "hold": False,
+            "expired": False,
             "channel": channel  # Store the channel associated with the slot
         }
 
@@ -256,7 +290,11 @@ async def ping(interaction: discord.Interaction, ping_type: str):
         slot = slots[user.id]
         end_date = slot.get("end_date")
         if end_date is not None and end_date <= datetime.utcnow():
-            slots.pop(user.id, None)
+            if not slot.get("expired"):
+                await expire_slot(
+                    slot,
+                    "This slot has reached its end date and is now locked.",
+                )
             await send_response(
                 interaction,
                 "Your slot has expired. Please contact an owner to renew it.",
